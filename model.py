@@ -7,8 +7,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Function
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from torch.autograd import Variable
 
 from op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d, conv2d_gradfix
+
+from miscc.config import cfg
 
 
 class PixelNorm(nn.Module):
@@ -403,7 +407,6 @@ class Generator(nn.Module):
         self.size = size
 
         self.style_dim = style_dim
-
         layers = [PixelNorm()]
 
         for i in range(n_mlp):
@@ -652,7 +655,12 @@ class Discriminator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
-        convs = [ConvLayer(3, channels[size], 1)]
+        # TODO
+        # should become an argument later on
+        self.ef_dim = 256
+        self.img_size = 256
+
+        convs = [ConvLayer(3 + self.ef_dim, channels[size], 1)]
 
         log_size = int(math.log(size, 2))
 
@@ -675,12 +683,18 @@ class Discriminator(nn.Module):
             EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu"),
             EqualLinear(channels[4], 1),
         )
+        self.sigmoid_layer = nn.Sigmoid()
 
-    def forward(self, input):
+    def forward(self, input, c_code=None):
+        if c_code is not None:
+            c_code = c_code.view(-1, self.ef_dim, 1, 1)
+            c_code = c_code.repeat(1, 1, self.img_size, self.img_size)
+            input = torch.cat((input, c_code), 1)
         out = self.convs(input)
 
         batch, channel, height, width = out.shape
         group = min(batch, self.stddev_group)
+
         stddev = out.view(
             group, -1, self.stddev_feat, channel // self.stddev_feat, height, width
         )
@@ -693,6 +707,119 @@ class Discriminator(nn.Module):
 
         out = out.view(batch, -1)
         out = self.final_linear(out)
+        logits = self.sigmoid_layer(out)
+        return out, logits
 
-        return out
 
+class RNN_ENCODER(nn.Module):
+    def __init__(
+        self,
+        ntoken,
+        ninput=300,
+        drop_prob=0.5,
+        nhidden=128,
+        nlayers=1,
+        bidirectional=True,
+    ):
+        super(RNN_ENCODER, self).__init__()
+        self.n_steps = cfg.TEXT.WORDS_NUM
+        self.ntoken = ntoken  # size of the dictionary
+        self.ninput = ninput  # size of each embedding vector
+        self.drop_prob = drop_prob  # probability of an element to be zeroed
+        self.nlayers = nlayers  # Number of recurrent layers
+        self.bidirectional = bidirectional
+        self.rnn_type = cfg.RNN_TYPE
+        if bidirectional:
+            self.num_directions = 2
+        else:
+            self.num_directions = 1
+        # number of features in the hidden state
+        self.nhidden = nhidden // self.num_directions
+
+        self.define_module()
+        self.init_weights()
+
+    def define_module(self):
+        self.encoder = nn.Embedding(self.ntoken, self.ninput)
+        self.drop = nn.Dropout(self.drop_prob)
+        if self.rnn_type == "LSTM":
+            # dropout: If non-zero, introduces a dropout layer on
+            # the outputs of each RNN layer except the last layer
+            self.rnn = nn.LSTM(
+                self.ninput,
+                self.nhidden,
+                self.nlayers,
+                batch_first=True,
+                dropout=self.drop_prob,
+                bidirectional=self.bidirectional,
+            )
+        elif self.rnn_type == "GRU":
+            self.rnn = nn.GRU(
+                self.ninput,
+                self.nhidden,
+                self.nlayers,
+                batch_first=True,
+                dropout=self.drop_prob,
+                bidirectional=self.bidirectional,
+            )
+        else:
+            raise NotImplementedError
+
+    def init_weights(self):
+        initrange = 0.1
+        self.encoder.weight.data.uniform_(-initrange, initrange)
+        # Do not need to initialize RNN parameters, which have been initialized
+        # http://pytorch.org/docs/master/_modules/torch/nn/modules/rnn.html#LSTM
+        # self.decoder.weight.data.uniform_(-initrange, initrange)
+        # self.decoder.bias.data.fill_(0)
+
+    def init_hidden(self, bsz):
+        device = "cuda:1"
+        weight = next(self.parameters()).data
+        if self.rnn_type == "LSTM":
+            return (
+                Variable(
+                    weight.new(
+                        self.nlayers * self.num_directions, bsz, self.nhidden
+                    ).zero_()
+                ).to(device),
+                Variable(
+                    weight.new(
+                        self.nlayers * self.num_directions, bsz, self.nhidden
+                    ).zero_()
+                ).to(device),
+            )
+        else:
+            return Variable(
+                weight.new(
+                    self.nlayers * self.num_directions, bsz, self.nhidden
+                ).zero_()
+            ).to(device)
+
+    def forward(self, captions, cap_lens, hidden, mask=None):
+        # input: torch.LongTensor of size batch x n_steps
+        # --> emb: batch x n_steps x ninput
+        emb = self.drop(self.encoder(captions))
+        #
+        # Returns: a PackedSequence object
+        cap_lens = cap_lens.data.tolist()
+        emb = pack_padded_sequence(emb, cap_lens, batch_first=True)
+        # #hidden and memory (num_layers * num_directions, batch, hidden_size):
+        # tensor containing the initial hidden state for each element in batch.
+        # #output (batch, seq_len, hidden_size * num_directions)
+        # #or a PackedSequence object:
+        # tensor containing output features (h_t) from the last layer of RNN
+        output, hidden = self.rnn(emb, hidden)
+        # PackedSequence object
+        # --> (batch, seq_len, hidden_size * num_directions)
+        output = pad_packed_sequence(output, batch_first=True)[0]
+        # output = self.drop(output)
+        # --> batch x hidden_size*num_directions x seq_len
+        words_emb = output.transpose(1, 2)
+        # --> batch x num_directions*hidden_size
+        if self.rnn_type == "LSTM":
+            sent_emb = hidden[0].transpose(0, 1).contiguous()
+        else:
+            sent_emb = hidden.transpose(0, 1).contiguous()
+        sent_emb = sent_emb.view(-1, self.nhidden * self.num_directions)
+        return words_emb, sent_emb
