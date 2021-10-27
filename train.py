@@ -41,7 +41,7 @@ from distributed import (
 from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
 
-device = "cuda:1"
+device = "cuda"
 device_id = 1
 TRANSFORMER_ENCODER = "gpt2"
 
@@ -149,6 +149,7 @@ def train(
     g_ema,
     device,
     text_encoder_type="rnn",
+    conditioned=False
 ):
     loader = sample_data(loader)
 
@@ -186,27 +187,28 @@ def train(
     sample_captions = sample_captions.to(device)
 
     sample_z = torch.randn(cfg.TRAIN.BATCH_SIZE, args.latent, device=device)
-    if text_encoder_type == "rnn":
-        hidden = text_encoder.init_hidden(cfg.TRAIN.BATCH_SIZE)
-        # print(hidden[0].device)
-        sample_words_embs, sample_sent_emb = text_encoder(
-            sample_captions, cap_lens, hidden
+    if conditioned:
+        if text_encoder_type == "rnn":
+            hidden = text_encoder.init_hidden(cfg.TRAIN.BATCH_SIZE)
+            # print(hidden[0].device)
+            sample_words_embs, sample_sent_emb = text_encoder(
+                sample_captions, cap_lens, hidden
+            )
+        elif text_encoder_type == "transformer":
+            sample_words_embs = (
+                text_encoder(sample_captions)[0].transpose(1, 2).contiguous()
+            )
+            sample_sent_emb = sample_words_embs[:, :, -1].contiguous()
+        # words_embs: batch_size x nef x seq_len
+        # sent_emb: batch_size x nef
+        sample_words_embs, sample_sent_emb = (
+            sample_words_embs.detach(),
+            sample_sent_emb.detach(),
         )
-    elif text_encoder_type == "transformer":
-        sample_words_embs = (
-            text_encoder(sample_captions)[0].transpose(1, 2).contiguous()
-        )
-        sample_sent_emb = sample_words_embs[:, :, -1].contiguous()
-    # words_embs: batch_size x nef x seq_len
-    # sent_emb: batch_size x nef
-    sample_words_embs, sample_sent_emb = (
-        sample_words_embs.detach(),
-        sample_sent_emb.detach(),
-    )
-    mask = sample_captions == 0
-    num_words = sample_words_embs.size(2)
-    if mask.size(1) > num_words:
-        mask = mask[:, :num_words]
+        mask = sample_captions == 0
+        num_words = sample_words_embs.size(2)
+        if mask.size(1) > num_words:
+            mask = mask[:, :num_words]
 
     for idx in pbar:
         i = idx + args.start_iter
@@ -222,31 +224,32 @@ def train(
         # print(cap_lens.device)
         real_img = real_img.to(device)
         captions = captions.to(device)
-
-        if text_encoder_type == "rnn":
-            hidden = text_encoder.init_hidden(real_img.shape[0])
-            # print(hidden[0].device)
-            words_embs, sent_emb = text_encoder(captions, cap_lens, hidden)
-        elif text_encoder_type == "transformer":
-            words_embs = text_encoder(captions)[0].transpose(1, 2).contiguous()
-            sent_emb = words_embs[:, :, -1].contiguous()
-        # words_embs: batch_size x nef x seq_len
-        # sent_emb: batch_size x nef
-        words_embs, sent_emb = words_embs.detach(), sent_emb.detach()
-        mask = captions == 0
-        num_words = words_embs.size(2)
-        if mask.size(1) > num_words:
-            mask = mask[:, :num_words]
+         
+        if conditioned:
+            if text_encoder_type == "rnn":
+                hidden = text_encoder.init_hidden(real_img.shape[0])
+                # print(hidden[0].device)
+                words_embs, sent_emb = text_encoder(captions, cap_lens, hidden)
+            elif text_encoder_type == "transformer":
+                words_embs = text_encoder(captions)[0].transpose(1, 2).contiguous()
+                sent_emb = words_embs[:, :, -1].contiguous()
+            # words_embs: batch_size x nef x seq_len
+            # sent_emb: batch_size x nef
+            words_embs, sent_emb = words_embs.detach(), sent_emb.detach()
+            mask = captions == 0
+            num_words = words_embs.size(2)
+            if mask.size(1) > num_words:
+                mask = mask[:, :num_words]
 
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
         noise = mixing_noise(real_img.shape[0], args.latent, args.mixing, device)
-        if type(noise) is tuple or type(noise) is list:
+        if (type(noise) is tuple or type(noise) is list) and conditioned:
             noise = [torch.torch.cat((ns, sent_emb), 1) for ns in noise]
-        else:
+        elif conditioned:
             noise = torch.cat((noise, sent_emb), 1)
-
+    
         fake_img, _ = generator(noise)
 
         if args.augment:
@@ -267,8 +270,8 @@ def train(
         real_pred, real_logits = discriminator(real_img_aug, sent_emb)
         d_loss = (
             d_logistic_loss(real_pred, fake_pred)
-            + nn.BCELoss()(fake_logits, fake_labels)
-            + nn.BCELoss()(real_logits, real_labels)
+            + ( nn.BCELoss()(fake_logits, fake_labels)
+                + nn.BCELoss()(real_logits, real_labels) ) if conditioned else 0
         )
 
         loss_dict["d"] = d_loss
@@ -308,10 +311,11 @@ def train(
         requires_grad(discriminator, False)
 
         noise = mixing_noise(real_img.shape[0], args.latent, args.mixing, device)
-        if type(noise) is tuple or type(noise) is list:
+        if (type(noise) is tuple or type(noise) is list) and conditioned:
             noise = [torch.torch.cat((ns, sent_emb), 1) for ns in noise]
-        else:
+        elif conditioned:
             noise = torch.cat((noise, sent_emb), 1)
+
         fake_img, _ = generator(noise)
 
         if args.augment:
@@ -400,7 +404,9 @@ def train(
             if i % 100 == 0:
                 with torch.no_grad():
                     g_ema.eval()
-                    sample_encoded = torch.cat((sample_z, sample_sent_emb), 1)
+                    sample_encoded = torch.cat((sample_z, sample_sent_emb), 1) \
+                                    if conditioned else sample_z
+
                     sample, _ = g_ema([sample_encoded])
                     utils.save_image(
                         sample,
@@ -538,6 +544,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enc_size", type=int, default=256, help="size of the sentence embeddings",
     )
+    parser.add_argument(
+        "--cond", type=bool, default=False, help="size of the sentence embeddings",
+    )
 
     args = parser.parse_args()
 
@@ -562,7 +571,7 @@ if __name__ == "__main__":
         from swagan import Generator, Discriminator
     generator = Generator(
         args.size,
-        args.latent + cfg.TEXT.EMBEDDING_DIM,
+        args.latent + cfg.TEXT.EMBEDDING_DIM if args.cond else 0,
         args.n_mlp,
         channel_multiplier=args.channel_multiplier,
     ).to(device)
@@ -571,7 +580,7 @@ if __name__ == "__main__":
     ).to(device)
     g_ema = Generator(
         args.size,
-        args.latent + args.enc_size,
+        args.latent + cfg.TEXT.EMBEDDING_DIM if args.cond else 0,
         args.n_mlp,
         channel_multiplier=args.channel_multiplier,
     ).to(device)
@@ -692,5 +701,6 @@ if __name__ == "__main__":
         d_optim,
         g_ema,
         device,
+        conditioned=args.cond
     )
 

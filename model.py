@@ -782,19 +782,19 @@ class RNN_ENCODER(nn.Module):
                     weight.new(
                         self.nlayers * self.num_directions, bsz, self.nhidden
                     ).zero_()
-                ).to(device),
+                ).cuda(),
                 Variable(
                     weight.new(
                         self.nlayers * self.num_directions, bsz, self.nhidden
                     ).zero_()
-                ).to(device),
+                ).cuda(),
             )
         else:
             return Variable(
                 weight.new(
                     self.nlayers * self.num_directions, bsz, self.nhidden
                 ).zero_()
-            ).to(device)
+            ).cuda()
 
     def forward(self, captions, cap_lens, hidden, mask=None):
         # input: torch.LongTensor of size batch x n_steps
