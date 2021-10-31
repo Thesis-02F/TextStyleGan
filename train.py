@@ -19,9 +19,9 @@ from miscc.config import cfg, cfg_from_file
 from miscc.utils import collapse_dirs, mv_to_paths
 from miscc.metrics import compute_ppl
 from captions_datasets import TextDataset, ImageFolderDataset, prepare_data
-from miscc.losses import words_loss
+from miscc.losses import words_loss, sent_loss
 from miscc.losses import discriminator_loss, generator_loss, KL_loss
-from model import RNN_ENCODER
+from model import RNN_ENCODER , CNN_ENCODER 
 
 try:
     import wandb
@@ -144,6 +144,7 @@ def train(
     generator,
     discriminator,
     text_encoder,
+    image_encoder,
     g_optim,
     d_optim,
     g_ema,
@@ -224,7 +225,8 @@ def train(
         # print(cap_lens.device)
         real_img = real_img.to(device)
         captions = captions.to(device)
-         
+        
+
         if conditioned:
             if text_encoder_type == "rnn":
                 hidden = text_encoder.init_hidden(real_img.shape[0])
@@ -265,6 +267,8 @@ def train(
         fake_labels = Variable(torch.FloatTensor(real_img.shape[0], 1).fill_(0)).to(
             device
         )
+        match_labels = Variable(torch.LongTensor(range(cfg.TRAIN.BATCH_SIZE))).to(device)
+
 
         fake_pred, fake_logits = discriminator(fake_img, sent_emb)
         real_pred, real_logits = discriminator(real_img_aug, sent_emb)
@@ -322,9 +326,24 @@ def train(
             fake_img, _ = augment(fake_img, ada_aug_p)
 
         fake_pred, _ = discriminator(fake_img, sent_emb)
+
         g_loss = g_nonsaturating_loss(fake_pred)
 
+        ## add img encoder and sent lostt
+        region_features, cnn_code = image_encoder(fake_img)
+
+
+        s_loss0, s_loss1 = sent_loss(cnn_code, sent_emb,
+                                         match_labels, class_ids, cfg.TRAIN.BATCH_SIZE)
+
+        s_loss = (s_loss0 + s_loss1) * \
+                cfg.TRAIN.SMOOTH.LAMBDA
+
+        ### add s_loss to g_loss
+        g_loss+=s_loss   
+            
         loss_dict["g"] = g_loss
+        loss_dict['sent']=s_loss
 
         generator.zero_grad()
         g_loss.backward()
@@ -374,14 +393,14 @@ def train(
         # path_loss_val = loss_reduced["path"].mean().item()
         real_score_val = loss_reduced["real_score"].mean().item()
         fake_score_val = loss_reduced["fake_score"].mean().item()
+        sent_loss_val=loss_reduced['sent'].mean().item()
         # path_length_val = loss_reduced["path_length"].mean().item()
 
         if get_rank() == 0:
             pbar.set_description(
                 (
-                    f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
+                    f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f};  sen: {sent_loss_val:.4f};"
                     # f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
-                    f"augment: {ada_aug_p:.4f}"
                 )
             )
 
@@ -454,7 +473,7 @@ if __name__ == "__main__":
         "--iter", type=int, default=800000, help="total training iterations"
     )
     parser.add_argument(
-        "--batch", type=int, default=8, help="batch sizes for each gpus"
+        "--batch", type=int, default=cfg.TRAIN.BATCH_SIZE, help="batch sizes for each gpus"
     )
     parser.add_argument(
         "--n_sample",
@@ -619,12 +638,29 @@ if __name__ == "__main__":
         text_encoder = RNN_ENCODER(dataset.n_words, nhidden=cfg.TEXT.EMBEDDING_DIM)
     elif args.text_encoder_type == "transformer":
         text_encoder = GPT2Model.from_pretrained(TRANSFORMER_ENCODER)
+
     state_dict = torch.load(cfg.TRAIN.NET_E, map_location=lambda storage, loc: storage)
     text_encoder.load_state_dict(state_dict)
     for p in text_encoder.parameters():
         p.requires_grad = False
     print("Load text encoder from:", cfg.TRAIN.NET_E)
+    text_encoder.eval()
     text_encoder = text_encoder.to(device)
+
+    #img encoder
+    image_encoder = CNN_ENCODER(cfg.TEXT.EMBEDDING_DIM)
+    img_encoder_path = cfg.TRAIN.NET_E.replace('text_encoder', 'image_encoder')
+    state_dict = \
+        torch.load(img_encoder_path, map_location=lambda storage, loc: storage)
+    image_encoder.load_state_dict(state_dict)
+    for p in image_encoder.parameters():
+        p.requires_grad = False
+    print('Load image encoder from:', img_encoder_path)
+    image_encoder.eval()
+    image_encoder=image_encoder.to(device)
+
+
+
     g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
     d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
 
@@ -673,12 +709,20 @@ if __name__ == "__main__":
             broadcast_buffers=False,
         )
 
-        text_encoder = nn.parallel.DistributedDataParallel(
-            text_encoder,
-            device_ids=[args.local_rank],
-            output_device=args.local_rank,
-            broadcast_buffers=False,
-        )
+        # text_encoder = nn.parallel.DistributedDataParallel(
+        #     text_encoder,
+        #     device_ids=[args.local_rank],
+        #     output_device=args.local_rank,
+        #     broadcast_buffers=False,
+        # )
+
+        # image_encoder=nn.parallel.DistributedDataParallel(
+        #     image_encoder,
+        #     device_ids=[args.local_rank],
+        #     output_device=args.local_rank,
+        #     broadcast_buffers=False,
+        # )
+
 
     # dataset = MultiResolutionDataset(args.path, transform, args.size)
     # loader = data.DataLoader(
@@ -690,13 +734,13 @@ if __name__ == "__main__":
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
-
     train(
         args,
         dataloader,
         generator,
         discriminator,
         text_encoder,
+        image_encoder,
         g_optim,
         d_optim,
         g_ema,
